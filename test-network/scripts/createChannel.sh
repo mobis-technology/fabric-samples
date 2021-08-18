@@ -1,32 +1,48 @@
 #!/bin/bash
 
-# imports  
-. scripts/envVar.sh
-. scripts/utils.sh
+source scriptUtils.sh
 
 CHANNEL_NAME="$1"
 DELAY="$2"
 MAX_RETRY="$3"
 VERBOSE="$4"
-: ${CHANNEL_NAME:="mychannel"}
+: ${CHANNEL_NAME:="aipanchannel"}
 : ${DELAY:="3"}
 : ${MAX_RETRY:="5"}
 : ${VERBOSE:="false"}
+
+# import utils
+. scripts/envVar.sh
 
 if [ ! -d "channel-artifacts" ]; then
 	mkdir channel-artifacts
 fi
 
-createChannelGenesisBlock() {
-	which configtxgen
-	if [ "$?" -ne 0 ]; then
-		fatalln "configtxgen tool not found."
-	fi
+createChannelTx() {
+
 	set -x
-	configtxgen -profile TwoOrgsApplicationGenesis -outputBlock ./channel-artifacts/${CHANNEL_NAME}.block -channelID $CHANNEL_NAME
+	configtxgen -profile TwoOrgsChannel -outputCreateChannelTx ./channel-artifacts/${CHANNEL_NAME}.tx -channelID $CHANNEL_NAME
 	res=$?
 	{ set +x; } 2>/dev/null
-  verifyResult $res "Failed to generate channel configuration transaction..."
+	if [ $res -ne 0 ]; then
+		fatalln "Failed to generate channel configuration transaction..."
+	fi
+
+}
+
+createAncorPeerTx() {
+
+	for orgmsp in Org1MSP Org2MSP; do
+
+	infoln "Generating anchor peer update transaction for ${orgmsp}"
+	set -x
+	configtxgen -profile TwoOrgsChannel -outputAnchorPeersUpdate ./channel-artifacts/${orgmsp}anchors.tx -channelID $CHANNEL_NAME -asOrg ${orgmsp}
+	res=$?
+	{ set +x; } 2>/dev/null
+	if [ $res -ne 0 ]; then
+		fatalln "Failed to generate anchor peer update transaction for ${orgmsp}..."
+	fi
+	done
 }
 
 createChannel() {
@@ -37,7 +53,7 @@ createChannel() {
 	while [ $rc -ne 0 -a $COUNTER -lt $MAX_RETRY ] ; do
 		sleep $DELAY
 		set -x
-		osnadmin channel join --channelID $CHANNEL_NAME --config-block ./channel-artifacts/${CHANNEL_NAME}.block -o localhost:7053 --ca-file "$ORDERER_CA" --client-cert "$ORDERER_ADMIN_TLS_SIGN_CERT" --client-key "$ORDERER_ADMIN_TLS_PRIVATE_KEY" >&log.txt
+		peer channel create -o localhost:7050 -c $CHANNEL_NAME --ordererTLSHostnameOverride orderer.example.com -f ./channel-artifacts/${CHANNEL_NAME}.tx --outputBlock ./channel-artifacts/${CHANNEL_NAME}.block --tls --cafile $ORDERER_CA >&log.txt
 		res=$?
 		{ set +x; } 2>/dev/null
 		let rc=$res
@@ -45,11 +61,11 @@ createChannel() {
 	done
 	cat log.txt
 	verifyResult $res "Channel creation failed"
+	successln "Channel '$CHANNEL_NAME' created"
 }
 
-# joinChannel ORG
+# queryCommitted ORG
 joinChannel() {
-  FABRIC_CFG_PATH=$PWD/../config/
   ORG=$1
   setGlobals $ORG
 	local rc=1
@@ -58,7 +74,7 @@ joinChannel() {
 	while [ $rc -ne 0 -a $COUNTER -lt $MAX_RETRY ] ; do
     sleep $DELAY
     set -x
-    peer channel join -b $BLOCKFILE >&log.txt
+    peer channel join -b ./channel-artifacts/$CHANNEL_NAME.block >&log.txt
     res=$?
     { set +x; } 2>/dev/null
 		let rc=$res
@@ -68,35 +84,61 @@ joinChannel() {
 	verifyResult $res "After $MAX_RETRY attempts, peer0.org${ORG} has failed to join channel '$CHANNEL_NAME' "
 }
 
-setAnchorPeer() {
+updateAnchorPeers() {
   ORG=$1
-  docker exec cli ./scripts/setAnchorPeer.sh $ORG $CHANNEL_NAME 
+  setGlobals $ORG
+	local rc=1
+	local COUNTER=1
+	## Sometimes Join takes time, hence retry
+	while [ $rc -ne 0 -a $COUNTER -lt $MAX_RETRY ] ; do
+    sleep $DELAY
+    set -x
+		peer channel update -o localhost:7050 --ordererTLSHostnameOverride orderer.example.com -c $CHANNEL_NAME -f ./channel-artifacts/${CORE_PEER_LOCALMSPID}anchors.tx --tls --cafile $ORDERER_CA >&log.txt
+    res=$?
+    { set +x; } 2>/dev/null
+		let rc=$res
+		COUNTER=$(expr $COUNTER + 1)
+	done
+	cat log.txt
+  verifyResult $res "Anchor peer update failed"
+  successln "Anchor peers updated for org '$CORE_PEER_LOCALMSPID' on channel '$CHANNEL_NAME'"
+  sleep $DELAY
+}
+
+verifyResult() {
+  if [ $1 -ne 0 ]; then
+    fatalln "$2"
+  fi
 }
 
 FABRIC_CFG_PATH=${PWD}/configtx
 
-## Create channel genesis block
-infoln "Generating channel genesis block '${CHANNEL_NAME}.block'"
-createChannelGenesisBlock
+## Create channeltx
+infoln "Generating channel create transaction '${CHANNEL_NAME}.tx'"
+createChannelTx
+
+## Create anchorpeertx
+infoln "Generating anchor peer update transactions"
+createAncorPeerTx
 
 FABRIC_CFG_PATH=$PWD/../config/
-BLOCKFILE="./channel-artifacts/${CHANNEL_NAME}.block"
 
 ## Create channel
 infoln "Creating channel ${CHANNEL_NAME}"
 createChannel
-successln "Channel '$CHANNEL_NAME' created"
 
 ## Join all the peers to the channel
-infoln "Joining org1 peer to the channel..."
+infoln "Join Org1 peers to the channel..."
 joinChannel 1
-infoln "Joining org2 peer to the channel..."
+infoln "Join Org2 peers to the channel..."
 joinChannel 2
 
 ## Set the anchor peers for each org in the channel
-infoln "Setting anchor peer for org1..."
-setAnchorPeer 1
-infoln "Setting anchor peer for org2..."
-setAnchorPeer 2
+infoln "Updating anchor peers for org1..."
+updateAnchorPeers 1
+infoln "Updating anchor peers for org2..."
+updateAnchorPeers 2
 
-successln "Channel '$CHANNEL_NAME' joined"
+successln "Channel successfully joined"
+
+exit 0
